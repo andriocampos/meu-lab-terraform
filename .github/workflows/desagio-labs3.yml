@@ -1,0 +1,45 @@
+name: 'Meu Primeiro workflow'
+
+on:
+    push:
+        branches: ["main"]
+    workflow_dispatch:
+
+permissions:
+    id-token: write
+    contents: read
+
+jobs:
+    meu-primeiro-job:
+        name: 'Meu Primeiro Job'
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout do Código
+              uses: actions/checkout@v4
+
+            - name: Exibir mensagem
+              run: echo "Olá, mundo! Este é o meu primeiro workflow no GitHub Actions."
+
+            - name: Exibir informações do ambiente
+              run: |
+                echo "Sistema Operacional: $(uname -s)"
+                echo "Versão do Shell: $SHELL"
+                echo "Diretório Atual: $(pwd)"
+
+    minha-primeira-acao-aws:
+        name: 'Minha Primeira Ação AWS - Lista Buckets S3'
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout do Código
+              uses: actions/checkout@v4
+
+            - name: Autenticação AWS via OIDC
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+                aws-region: us-east-1
+
+            - name: Listar Buckets S3
+              run: aws s3 ls
