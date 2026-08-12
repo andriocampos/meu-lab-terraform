@@ -3,7 +3,7 @@
 # =============================================================================
 
 resource "aws_security_group" "demo" {
-  name        = "sg-${var.environment}"
+  name        = "sre-demo-allow-http-ssh"
   description = "Permite HTTP e SSH para a demo SRE"
   vpc_id      = aws_vpc.this.id
 
@@ -32,7 +32,7 @@ resource "aws_security_group" "demo" {
   }
 
   tags = {
-    Name        = "sg-${var.environment}"
+    Name        = "sre-demo-allow-http-ssh"
     Environment = var.environment
   }
 }
