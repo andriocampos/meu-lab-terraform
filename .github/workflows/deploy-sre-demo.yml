@@ -71,10 +71,7 @@ jobs:
             aws s3api create-bucket \
               --bucket "${{ env.STATE_BUCKET }}" \
               --region "${{ env.AWS_REGION }}"
-            aws s3api put-bucket-versioning \
-              --bucket "${{ env.STATE_BUCKET }}" \
-              --versioning-configuration Status=Enabled
-            echo "✓ Bucket criado com versionamento"
+            echo "✓ Bucket criado"
           fi
 
       - name: Terraform Init (com backend S3)
@@ -126,7 +123,24 @@ jobs:
         if: github.event.inputs.action == 'destroy'
         run: |
           echo "🗑️ Removendo bucket de state..."
-          aws s3 rb "s3://${{ env.STATE_BUCKET }}" --force
+          # Deletar todas as versões de objetos (necessário com versionamento habilitado)
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          # Deletar delete markers
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          # Agora deletar o bucket vazio
+          aws s3 rb "s3://${{ env.STATE_BUCKET }}"
           echo "✓ Bucket de state removido"
 
   # ===========================================================================
