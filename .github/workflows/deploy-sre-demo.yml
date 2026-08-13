@@ -1,10 +1,13 @@
 # =============================================================================
 # PIPELINE ONE-CLICK — SRE Demo
 # Cria VPC + EC2, executa Ansible (Docker + App + Monitoramento), valida e
-# exibe custo/hora. Opção de destroy total com um clique.
+# exibe custo/hora. Auto-destroy após 15 minutos.
+#
+# SEGURANÇA DE CUSTO:
+#   - Auto-destroy após 15 minutos (impede esquecimento)
+#   - Bloqueio de execuções simultâneas (impede infra duplicada)
 #
 # STATE: Backend S3 efêmero — criado no apply, destruído no destroy.
-# Pode ser executado múltiplas vezes sem conflito.
 # =============================================================================
 
 name: '🚀 SRE Demo - Deploy/Destroy'
@@ -24,19 +27,114 @@ on:
 permissions:
   id-token: write
   contents: read
+  actions: write
 
 env:
   TF_WORKING_DIR: infra-demo
   AWS_REGION: us-east-1
   STATE_BUCKET: tfstate-sre-demo-lab
+  LAB_TTL_MINUTES: 15
 
 jobs:
+  # ===========================================================================
+  # JOB 0: VERIFICAÇÃO DE EXECUÇÃO SIMULTÂNEA
+  # ===========================================================================
+  check-running:
+    name: '🔒 Verificar execução simultânea'
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'apply'
+
+    steps:
+      - name: Autenticação AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verificar se já existe infra ativa
+        run: |
+          echo "🔍 Verificando se existe infraestrutura ativa..."
+
+          # Buscar instâncias EC2 com tag do lab que estejam rodando
+          INSTANCE_INFO=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Environment,Values=sre-demo" \
+              "Name=instance-state-name,Values=running,pending" \
+            --query 'Reservations[].Instances[].[LaunchTime,InstanceId]' \
+            --output text)
+
+          if [ -z "$INSTANCE_INFO" ]; then
+            echo "✓ Nenhuma instância ativa. Pode prosseguir com o deploy."
+            exit 0
+          fi
+
+          # Calcular tempo de execução e tempo restante
+          LAUNCH_TIME=$(echo "$INSTANCE_INFO" | awk '{print $1}')
+          INSTANCE_ID=$(echo "$INSTANCE_INFO" | awk '{print $2}')
+
+          LAUNCH_EPOCH=$(date -d "$LAUNCH_TIME" +%s)
+          NOW_EPOCH=$(date +%s)
+          ELAPSED_SECONDS=$((NOW_EPOCH - LAUNCH_EPOCH))
+          ELAPSED_MINUTES=$((ELAPSED_SECONDS / 60))
+
+          TTL_SECONDS=$(( ${{ env.LAB_TTL_MINUTES }} * 60 ))
+          REMAINING_SECONDS=$((TTL_SECONDS - ELAPSED_SECONDS))
+          REMAINING_MINUTES=$((REMAINING_SECONDS / 60))
+
+          # Se já passou do TTL, a instância deveria estar sendo destruída
+          if [ $REMAINING_SECONDS -le 0 ]; then
+            echo "⚠️ Instância ultrapassou o TTL. O auto-destroy deve estar em andamento."
+            echo "   Aguarde 2-3 minutos e tente novamente."
+            exit 1
+          fi
+
+          # Bloquear com mensagem amigável
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║           🚫  EXECUÇÃO BLOQUEADA                            ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                              ║"
+          echo "║  O Lab já está em execução há ${ELAPSED_MINUTES} min.        ║"
+          echo "║  Faltam ${REMAINING_MINUTES} min para o destroy automático.  ║"
+          echo "║                                                              ║"
+          echo "║  Instance ID: ${INSTANCE_ID}                                 ║"
+          echo "║                                                              ║"
+          echo "║  Opções:                                                     ║"
+          echo "║    1. Aguarde o destroy automático                           ║"
+          echo "║    2. Execute manualmente com action = destroy               ║"
+          echo "║                                                              ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          # Job Summary com erro visual
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🚫 Execução Bloqueada
+
+          **O Lab já está em execução há ${ELAPSED_MINUTES} minutos.**
+          Faltam **${REMAINING_MINUTES} minutos** para o destroy automático.
+
+          | Info | Valor |
+          |------|-------|
+          | Instance ID | \`${INSTANCE_ID}\` |
+          | Iniciado em | \`${LAUNCH_TIME}\` |
+          | Tempo ativo | ${ELAPSED_MINUTES} min |
+          | Destroy em | ${REMAINING_MINUTES} min |
+
+          ### O que fazer?
+          1. ⏳ Aguarde o destroy automático (${REMAINING_MINUTES} min)
+          2. 🗑️ Execute manualmente: **Actions → Run workflow → \`destroy\`**
+          EOF
+
+          exit 1
+
   # ===========================================================================
   # JOB 1: INFRAESTRUTURA (Terraform)
   # ===========================================================================
   infra:
     name: '🏗️ Terraform ${{ github.event.inputs.action }}'
     runs-on: ubuntu-latest
+    needs: check-running
+    if: always() && (needs.check-running.result == 'success' || github.event.inputs.action == 'destroy')
 
     outputs:
       instance_ip: ${{ steps.tf_output.outputs.instance_ip }}
@@ -123,7 +221,7 @@ jobs:
         if: github.event.inputs.action == 'destroy'
         run: |
           echo "🗑️ Removendo bucket de state..."
-          # Deletar todas as versões de objetos (necessário com versionamento habilitado)
+          # Deletar todas as versões de objetos
           aws s3api list-object-versions \
             --bucket "${{ env.STATE_BUCKET }}" \
             --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
@@ -139,7 +237,7 @@ jobs:
           aws s3api delete-objects \
             --bucket "${{ env.STATE_BUCKET }}" \
             --delete file:///dev/stdin 2>/dev/null || true
-          # Agora deletar o bucket vazio
+          # Deletar o bucket vazio
           aws s3 rb "s3://${{ env.STATE_BUCKET }}"
           echo "✓ Bucket de state removido"
 
@@ -211,6 +309,7 @@ jobs:
         run: |
           IP="${{ needs.infra.outputs.instance_ip }}"
           TYPE="${{ needs.infra.outputs.instance_type }}"
+          TTL="${{ env.LAB_TTL_MINUTES }}"
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════════╗"
@@ -235,11 +334,10 @@ jobs:
           echo "║  ─────────────────────────────────────────                   ║"
           echo "║  TOTAL:                 \$0.0126/hora                         ║"
           echo "║                         ~R\$ 0.07/hora                       ║"
-          echo "║                         ~R\$ 1.72/dia (24h)                  ║"
           echo "║                                                              ║"
           echo "╠══════════════════════════════════════════════════════════════╣"
-          echo "║  ⚠️  LEMBRE-SE: Execute DESTROY após a demo!                ║"
-          echo "║      Actions → Run workflow → destroy                        ║"
+          echo "║  ⏱️  AUTO-DESTROY em ${TTL} minutos                          ║"
+          echo "║     A infra será destruída automaticamente.                  ║"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
 
@@ -247,6 +345,7 @@ jobs:
         run: |
           IP="${{ needs.infra.outputs.instance_ip }}"
           TYPE="${{ needs.infra.outputs.instance_type }}"
+          TTL="${{ env.LAB_TTL_MINUTES }}"
 
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🚀 SRE Demo — Deploy Concluído
@@ -275,13 +374,115 @@ jobs:
           | EBS 20GB gp3 | \$0.0022 |
           | **TOTAL** | **\$0.0126/hr (~R\$ 0.07/hr)** |
 
-          ---
-          > ⚠️ **Não esqueça de executar DESTROY após a demonstração!**
-          > Acesse: Actions → 🚀 SRE Demo → Run workflow → \`destroy\`
+          ### ⏱️ Auto-Destroy
+          > A infraestrutura será **destruída automaticamente em ${TTL} minutos**.
+          > Não é necessário executar destroy manualmente.
           EOF
 
   # ===========================================================================
-  # JOB 4: DESTROY SUMMARY
+  # JOB 4: AUTO-DESTROY — Aguarda 15min e destrói tudo automaticamente
+  # ===========================================================================
+  auto-destroy:
+    name: '⏱️ Auto-Destroy (aguardando ${{ env.LAB_TTL_MINUTES }}min)'
+    runs-on: ubuntu-latest
+    needs: [infra, configure, summary]
+    if: github.event.inputs.action == 'apply'
+
+    steps:
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: Countdown para destroy
+        run: |
+          TTL=${{ env.LAB_TTL_MINUTES }}
+          echo "⏱️ Auto-destroy programado para ${TTL} minutos."
+          echo "   Infraestrutura será destruída às $(date -d "+${TTL} minutes" '+%H:%M:%S %Z')"
+          echo ""
+
+          # Countdown com feedback a cada minuto
+          for i in $(seq $TTL -1 1); do
+            echo "   ⏳ Restam ${i} minuto(s)..."
+            sleep 60
+          done
+
+          echo ""
+          echo "🔥 Tempo esgotado! Iniciando destroy..."
+
+      - name: Autenticação AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=sre-demo/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -auto-approve
+
+      - name: Destruir bucket de state S3
+        run: |
+          echo "🗑️ Removendo bucket de state..."
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          aws s3 rb "s3://${{ env.STATE_BUCKET }}"
+          echo "✓ Bucket removido"
+
+      - name: Resumo do auto-destroy
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║     ⏱️  AUTO-DESTROY CONCLUÍDO (TTL: ${{ env.LAB_TTL_MINUTES }}min)              ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                              ║"
+          echo "║  ✓ EC2 terminada                                            ║"
+          echo "║  ✓ VPC removida                                             ║"
+          echo "║  ✓ Todos os recursos eliminados                             ║"
+          echo "║                                                              ║"
+          echo "║  💰 Custo: \$0.00/hora                                      ║"
+          echo "║                                                              ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ⏱️ Auto-Destroy Concluído
+
+          A infraestrutura foi destruída automaticamente após **${{ env.LAB_TTL_MINUTES }} minutos**.
+
+          - ✅ EC2 Instance removida
+          - ✅ VPC + Subnet + IGW removidos
+          - ✅ Security Group + Key Pair removidos
+          - ✅ Bucket de state S3 removido
+
+          **💰 Custo atual: \$0.00/hora**
+          EOF
+
+  # ===========================================================================
+  # JOB 5: DESTROY SUMMARY (manual)
   # ===========================================================================
   destroy-summary:
     name: '🗑️ Destroy Concluído'
@@ -311,7 +512,7 @@ jobs:
       - name: Criar Job Summary
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## 🗑️ Infraestrutura Destruída
+          ## 🗑️ Infraestrutura Destruída (Manual)
 
           Todos os recursos foram removidos com sucesso:
           - ✅ VPC + Subnet + IGW
