@@ -1,10 +1,12 @@
 # =============================================================================
-# SAFETY NET — Limpa instâncias órfãs do lab SRE Demo
-# Roda a cada 30 minutos e termina qualquer EC2 com tag sre-demo
-# que esteja ativa há mais de 20 minutos (TTL do lab = 15min + margem).
+# SAFETY NET — Destroy completo de infraestrutura órfã
+# Roda a cada 30 minutos e destrói TODA a infra se a EC2 estiver ativa
+# há mais de 20 minutos (TTL do lab = 15min + margem de segurança).
+#
+# Faz terraform destroy completo (não apenas terminate da EC2).
 # =============================================================================
 
-name: '🧹 Cleanup - Orphan Instances'
+name: '🧹 Cleanup - Destroy Órfãos'
 
 on:
   schedule:
@@ -17,65 +19,137 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
+  TF_WORKING_DIR: infra-demo
+  STATE_BUCKET: tfstate-sre-demo-lab
   MAX_AGE_MINUTES: 20
 
 jobs:
   cleanup:
-    name: '🧹 Verificar instâncias órfãs'
+    name: '🧹 Verificar e destruir órfãos'
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
       - name: Autenticação AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Buscar e terminar instâncias órfãs
+      - name: Verificar se existe infra órfã
+        id: check
         run: |
-          echo "🧹 Verificando instâncias órfãs do lab SRE Demo..."
+          echo "🧹 Verificando infraestrutura órfã do lab SRE Demo..."
 
-          INSTANCES=$(aws ec2 describe-instances \
+          # Verificar se o bucket de state existe (indica lab ativo)
+          if ! aws s3api head-bucket --bucket "${{ env.STATE_BUCKET }}" 2>/dev/null; then
+            echo "✓ Nenhum lab ativo (bucket de state não existe). Tudo limpo!"
+            echo "orphan=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Bucket existe — verificar se há EC2 ativa e há quanto tempo
+          INSTANCE_INFO=$(aws ec2 describe-instances \
             --filters \
               "Name=tag:Environment,Values=sre-demo" \
               "Name=instance-state-name,Values=running,pending,stopped" \
             --query 'Reservations[].Instances[].[InstanceId,LaunchTime]' \
             --output text)
 
-          if [ -z "$INSTANCES" ]; then
-            echo "✓ Nenhuma instância ativa. Tudo limpo!"
+          if [ -z "$INSTANCE_INFO" ]; then
+            # Bucket existe mas sem EC2 = lixo de state. Limpar.
+            echo "⚠️ Bucket de state existe mas sem EC2 ativa. Limpando state órfão..."
+            echo "orphan=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
+          # Calcular idade da instância
+          LAUNCH_TIME=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $2}')
+          INSTANCE_ID=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $1}')
+          LAUNCH_EPOCH=$(date -d "$LAUNCH_TIME" +%s)
           NOW_EPOCH=$(date +%s)
-          TERMINATED=0
+          AGE_MINUTES=$(( (NOW_EPOCH - LAUNCH_EPOCH) / 60 ))
 
-          while IFS=$'\t' read -r INSTANCE_ID LAUNCH_TIME; do
-            LAUNCH_EPOCH=$(date -d "$LAUNCH_TIME" +%s)
-            AGE_MINUTES=$(( (NOW_EPOCH - LAUNCH_EPOCH) / 60 ))
+          echo "ℹ️ Instância $INSTANCE_ID ativa há ${AGE_MINUTES} minutos (limite: ${{ env.MAX_AGE_MINUTES }}min)"
 
-            if [ $AGE_MINUTES -gt ${{ env.MAX_AGE_MINUTES }} ]; then
-              echo "⚠️ Instância $INSTANCE_ID ativa há ${AGE_MINUTES}min (limite: ${{ env.MAX_AGE_MINUTES }}min)"
-              echo "   Terminando..."
-              aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
-              TERMINATED=$((TERMINATED + 1))
-            else
-              echo "ℹ️ Instância $INSTANCE_ID ativa há ${AGE_MINUTES}min (dentro do TTL)"
-            fi
-          done <<< "$INSTANCES"
-
-          if [ $TERMINATED -gt 0 ]; then
-            echo ""
-            echo "🗑️ $TERMINATED instância(s) órfã(s) terminada(s)."
-
-            cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## 🧹 Cleanup Executado
-
-          **$TERMINATED instância(s) órfã(s) terminada(s).**
-
-          Instâncias com tag \`Environment=sre-demo\` que ultrapassaram ${MAX_AGE_MINUTES} minutos
-          foram terminadas automaticamente para evitar custos desnecessários.
-          EOF
+          if [ $AGE_MINUTES -gt ${{ env.MAX_AGE_MINUTES }} ]; then
+            echo "⚠️ Instância ultrapassou o TTL! Iniciando destroy completo..."
+            echo "orphan=true" >> $GITHUB_OUTPUT
           else
-            echo "✓ Todas as instâncias estão dentro do TTL."
+            echo "✓ Instância dentro do TTL. Auto-destroy do workflow principal deve cuidar."
+            echo "orphan=false" >> $GITHUB_OUTPUT
           fi
+
+      - name: Setup Terraform
+        if: steps.check.outputs.orphan == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        if: steps.check.outputs.orphan == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=sre-demo/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Destroy
+        if: steps.check.outputs.orphan == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -auto-approve
+
+      - name: Destruir bucket de state S3
+        if: steps.check.outputs.orphan == 'true'
+        run: |
+          echo "🗑️ Removendo bucket de state..."
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          aws s3 rb "s3://${{ env.STATE_BUCKET }}" 2>/dev/null || true
+          echo "✓ Bucket removido"
+
+      - name: Resumo
+        if: steps.check.outputs.orphan == 'true'
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║     🧹 CLEANUP — INFRAESTRUTURA ÓRFÃ DESTRUÍDA             ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                              ║"
+          echo "║  ✓ Terraform destroy executado                              ║"
+          echo "║  ✓ VPC + EC2 + SG + Key Pair removidos                     ║"
+          echo "║  ✓ Bucket de state removido                                 ║"
+          echo "║                                                              ║"
+          echo "║  💰 Custo: \$0.00/hora                                      ║"
+          echo "║                                                              ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🧹 Cleanup Executado — Destroy Completo
+
+          Infraestrutura órfã detectada e destruída:
+          - ✅ Terraform destroy (VPC + EC2 + SG + Key Pair)
+          - ✅ Bucket de state S3 removido
+
+          **Motivo:** Instância ultrapassou TTL de ${{ env.MAX_AGE_MINUTES }} minutos
+          sem auto-destroy (workflow principal pode ter falhado).
+
+          **💰 Custo atual: \$0.00/hora**
+          EOF
