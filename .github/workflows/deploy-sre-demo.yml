@@ -64,22 +64,33 @@ jobs:
         run: |
           echo "🔍 Verificando se existe infraestrutura ativa..."
 
-          # Buscar instâncias EC2 com tag do lab que estejam rodando
+          # Buscar instâncias EC2 com tag do lab que estejam REALMENTE rodando
           INSTANCE_INFO=$(aws ec2 describe-instances \
             --filters \
               "Name=tag:Environment,Values=sre-demo" \
               "Name=instance-state-name,Values=running,pending" \
-            --query 'Reservations[].Instances[].[LaunchTime,InstanceId]' \
-            --output text)
+            --query 'Reservations[].Instances[].[LaunchTime,InstanceId,State.Name]' \
+            --output text | grep -E "running|pending" || true)
 
           if [ -z "$INSTANCE_INFO" ]; then
             echo "✓ Nenhuma instância ativa. Pode prosseguir com o deploy."
             exit 0
           fi
 
+          # Verificação dupla: confirmar que a instância realmente responde
+          INSTANCE_ID=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $2}')
+          REAL_STATE=$(aws ec2 describe-instance-status \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'InstanceStatuses[0].InstanceState.Name' \
+            --output text 2>/dev/null || echo "not-found")
+
+          if [ "$REAL_STATE" != "running" ] && [ "$REAL_STATE" != "pending" ]; then
+            echo "✓ Instância $INSTANCE_ID em estado '$REAL_STATE' (não ativa). Pode prosseguir."
+            exit 0
+          fi
+
           # Calcular tempo de execução e tempo restante
-          LAUNCH_TIME=$(echo "$INSTANCE_INFO" | awk '{print $1}')
-          INSTANCE_ID=$(echo "$INSTANCE_INFO" | awk '{print $2}')
+          LAUNCH_TIME=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $1}')
 
           LAUNCH_EPOCH=$(date -d "$LAUNCH_TIME" +%s)
           NOW_EPOCH=$(date +%s)
