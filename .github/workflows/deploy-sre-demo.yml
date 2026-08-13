@@ -46,115 +46,11 @@ env:
 
 jobs:
   # ===========================================================================
-  # JOB 0: VERIFICAÇÃO DE EXECUÇÃO SIMULTÂNEA
-  # ===========================================================================
-  check-running:
-    name: '🔒 Verificar execução simultânea'
-    runs-on: ubuntu-latest
-    if: github.event.inputs.action == 'apply'
-
-    steps:
-      - name: Autenticação AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Verificar se já existe infra ativa
-        run: |
-          echo "🔍 Verificando se existe infraestrutura ativa..."
-
-          # Buscar instâncias EC2 com tag do lab que estejam REALMENTE rodando
-          INSTANCE_INFO=$(aws ec2 describe-instances \
-            --filters \
-              "Name=tag:Environment,Values=sre-demo" \
-              "Name=instance-state-name,Values=running,pending" \
-            --query 'Reservations[].Instances[].[LaunchTime,InstanceId,State.Name]' \
-            --output text | grep -E "running|pending" || true)
-
-          if [ -z "$INSTANCE_INFO" ]; then
-            echo "✓ Nenhuma instância ativa. Pode prosseguir com o deploy."
-            exit 0
-          fi
-
-          # Verificação dupla: confirmar que a instância realmente responde
-          INSTANCE_ID=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $2}')
-          REAL_STATE=$(aws ec2 describe-instance-status \
-            --instance-ids "$INSTANCE_ID" \
-            --query 'InstanceStatuses[0].InstanceState.Name' \
-            --output text 2>/dev/null || echo "not-found")
-
-          if [ "$REAL_STATE" != "running" ] && [ "$REAL_STATE" != "pending" ]; then
-            echo "✓ Instância $INSTANCE_ID em estado '$REAL_STATE' (não ativa). Pode prosseguir."
-            exit 0
-          fi
-
-          # Calcular tempo de execução e tempo restante
-          LAUNCH_TIME=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $1}')
-
-          LAUNCH_EPOCH=$(date -d "$LAUNCH_TIME" +%s)
-          NOW_EPOCH=$(date +%s)
-          ELAPSED_SECONDS=$((NOW_EPOCH - LAUNCH_EPOCH))
-          ELAPSED_MINUTES=$((ELAPSED_SECONDS / 60))
-
-          TTL_SECONDS=$(( ${{ env.LAB_TTL_MINUTES }} * 60 ))
-          REMAINING_SECONDS=$((TTL_SECONDS - ELAPSED_SECONDS))
-          REMAINING_MINUTES=$((REMAINING_SECONDS / 60))
-
-          # Se já passou do TTL, a instância deveria estar sendo destruída
-          if [ $REMAINING_SECONDS -le 0 ]; then
-            echo "⚠️ Instância ultrapassou o TTL. O auto-destroy deve estar em andamento."
-            echo "   Aguarde 2-3 minutos e tente novamente."
-            exit 1
-          fi
-
-          # Bloquear com mensagem amigável
-          echo ""
-          echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║           🚫  EXECUÇÃO BLOQUEADA                            ║"
-          echo "╠══════════════════════════════════════════════════════════════╣"
-          echo "║                                                              ║"
-          echo "║  O Lab já está em execução há ${ELAPSED_MINUTES} min.        ║"
-          echo "║  Faltam ${REMAINING_MINUTES} min para o destroy automático.  ║"
-          echo "║                                                              ║"
-          echo "║  Instance ID: ${INSTANCE_ID}                                 ║"
-          echo "║                                                              ║"
-          echo "║  Opções:                                                     ║"
-          echo "║    1. Aguarde o destroy automático                           ║"
-          echo "║    2. Execute manualmente com action = destroy               ║"
-          echo "║                                                              ║"
-          echo "╚══════════════════════════════════════════════════════════════╝"
-          echo ""
-
-          # Job Summary com erro visual
-          cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## 🚫 Execução Bloqueada
-
-          **O Lab já está em execução há ${ELAPSED_MINUTES} minutos.**
-          Faltam **${REMAINING_MINUTES} minutos** para o destroy automático.
-
-          | Info | Valor |
-          |------|-------|
-          | Instance ID | \`${INSTANCE_ID}\` |
-          | Iniciado em | \`${LAUNCH_TIME}\` |
-          | Tempo ativo | ${ELAPSED_MINUTES} min |
-          | Destroy em | ${REMAINING_MINUTES} min |
-
-          ### O que fazer?
-          1. ⏳ Aguarde o destroy automático (${REMAINING_MINUTES} min)
-          2. 🗑️ Execute manualmente: **Actions → Run workflow → \`destroy\`**
-          EOF
-
-          exit 1
-
-  # ===========================================================================
   # JOB 1: INFRAESTRUTURA (Terraform)
   # ===========================================================================
   infra:
     name: '🏗️ Terraform ${{ github.event.inputs.action }}'
     runs-on: ubuntu-latest
-    needs: check-running
-    if: always() && (needs.check-running.result == 'success' || github.event.inputs.action == 'destroy')
 
     outputs:
       instance_ip: ${{ steps.tf_output.outputs.instance_ip }}
@@ -170,6 +66,61 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      # LOCK: Se o bucket de state existe, o lab já está ativo → bloqueia
+      # -----------------------------------------------------------------------
+      - name: '🔒 Verificar se lab já está ativo'
+        if: github.event.inputs.action == 'apply'
+        run: |
+          if aws s3api head-bucket --bucket "${{ env.STATE_BUCKET }}" 2>/dev/null; then
+            # Bucket existe = lab ativo. Calcular tempo restante.
+            CREATED=$(aws s3api list-objects-v2 \
+              --bucket "${{ env.STATE_BUCKET }}" \
+              --query 'Contents[0].LastModified' \
+              --output text 2>/dev/null || echo "")
+
+            if [ -n "$CREATED" ] && [ "$CREATED" != "None" ]; then
+              CREATED_EPOCH=$(date -d "$CREATED" +%s)
+              NOW_EPOCH=$(date +%s)
+              ELAPSED_MIN=$(( (NOW_EPOCH - CREATED_EPOCH) / 60 ))
+              REMAINING_MIN=$(( ${{ env.LAB_TTL_MINUTES }} - ELAPSED_MIN ))
+              [ $REMAINING_MIN -lt 0 ] && REMAINING_MIN=0
+            else
+              ELAPSED_MIN="?"
+              REMAINING_MIN="?"
+            fi
+
+            echo ""
+            echo "╔══════════════════════════════════════════════════════════════╗"
+            echo "║           🚫  EXECUÇÃO BLOQUEADA                            ║"
+            echo "╠══════════════════════════════════════════════════════════════╣"
+            echo "║                                                              ║"
+            echo "║  O Lab já está em execução há ~${ELAPSED_MIN} min.           ║"
+            echo "║  Faltam ~${REMAINING_MIN} min para o destroy automático.     ║"
+            echo "║                                                              ║"
+            echo "║  Opções:                                                     ║"
+            echo "║    1. Aguarde o destroy automático                           ║"
+            echo "║    2. Execute manualmente com action = destroy               ║"
+            echo "║                                                              ║"
+            echo "╚══════════════════════════════════════════════════════════════╝"
+            echo ""
+
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🚫 Execução Bloqueada
+
+          **O Lab já está ativo há ~${ELAPSED_MIN} minutos.**
+          Faltam **~${REMAINING_MIN} minutos** para o destroy automático.
+
+          ### O que fazer?
+          1. ⏳ Aguarde o destroy automático
+          2. 🗑️ Execute: **Actions → Run workflow → \`destroy\`**
+          EOF
+
+            exit 1
+          fi
+
+          echo "✓ Nenhum lab ativo. Prosseguindo com deploy..."
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
