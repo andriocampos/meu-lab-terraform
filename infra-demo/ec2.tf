@@ -47,11 +47,11 @@ resource "tls_private_key" "demo" {
 }
 
 resource "aws_key_pair" "demo" {
-  key_name   = var.key_name
-  public_key = tls_private_key.demo.public_key_openssh
+  key_name_prefix = "sre-demo-"
+  public_key      = tls_private_key.demo.public_key_openssh
 
   tags = {
-    Name        = var.key_name
+    Name        = "sre-demo-key"
     Environment = var.environment
   }
 }
