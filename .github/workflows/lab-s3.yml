@@ -1,0 +1,92 @@
+# =============================================================================
+# WORKFLOW DIDÁTICO - Cria e Destrói um Bucket S3
+# =============================================================================
+# Este workflow é disparado manualmente e aceita uma "escolha" (input):
+# - apply  → cria o bucket
+# - destroy → destrói o bucket
+#
+# ANATOMIA DE UM WORKFLOW:
+#
+#   name        → Nome que aparece na aba Actions
+#   on          → Evento que dispara o workflow
+#   permissions → Permissões do token OIDC
+#   jobs        → Conjunto de "trabalhos" que serão executados
+#   steps       → Passos dentro de cada job (executam em sequência)
+# =============================================================================
+
+name: 'Lab - S3 Bucket'
+
+# -----------------------------------------------------------------------------
+# TRIGGER: workflow_dispatch permite disparar manualmente com inputs
+# -----------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Ação a executar'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+# -----------------------------------------------------------------------------
+# PERMISSÕES: Necessárias para o OIDC funcionar
+# -----------------------------------------------------------------------------
+permissions:
+  id-token: write   # Permite solicitar o token JWT ao GitHub
+  contents: read    # Permite ler o código do repositório
+
+# -----------------------------------------------------------------------------
+# JOBS: Cada job roda em uma máquina virtual isolada
+# -----------------------------------------------------------------------------
+jobs:
+  s3-lab:
+    name: 'S3 - ${{ github.event.inputs.action }}'
+    runs-on: ubuntu-latest  # Máquina virtual Ubuntu fornecida pelo GitHub
+
+    # Variáveis de ambiente disponíveis em todos os steps deste job
+    defaults:
+      run:
+        working-directory: lab-s3  # Todos os comandos rodam nessa pasta
+
+    steps:
+      # Step 1: Baixa o código do repo para a VM
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
+      # Step 2: Autentica na AWS via OIDC (sem access keys!)
+      - name: Autenticação AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # Step 3: Instala o Terraform na VM
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+      # Step 4: Inicializa o Terraform (baixa providers)
+      - name: Terraform Init
+        run: terraform init
+
+      # Step 5: Mostra o plano (o que vai criar/destruir)
+      - name: Terraform Plan
+        run: |
+          if [ "${{ github.event.inputs.action }}" == "destroy" ]; then
+            terraform plan -destroy
+          else
+            terraform plan
+          fi
+
+      # Step 6: Executa a ação escolhida
+      - name: Terraform ${{ github.event.inputs.action }}
+        run: |
+          if [ "${{ github.event.inputs.action }}" == "destroy" ]; then
+            terraform destroy -auto-approve
+          else
+            terraform apply -auto-approve
+          fi

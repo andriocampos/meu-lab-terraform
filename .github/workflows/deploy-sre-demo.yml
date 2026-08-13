@@ -405,8 +405,8 @@ jobs:
   auto-destroy:
     name: '⏱️ Auto-Destroy (15min)'
     runs-on: ubuntu-latest
-    needs: [infra, configure, summary]
-    if: github.event.inputs.action == 'apply'
+    needs: [infra]
+    if: always() && needs.infra.result == 'success' && github.event.inputs.action == 'apply'
 
     steps:
       - name: Checkout do Código

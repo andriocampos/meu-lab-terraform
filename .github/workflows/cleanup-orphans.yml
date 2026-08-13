@@ -1,0 +1,81 @@
+# =============================================================================
+# SAFETY NET — Limpa instâncias órfãs do lab SRE Demo
+# Roda a cada 30 minutos e termina qualquer EC2 com tag sre-demo
+# que esteja ativa há mais de 20 minutos (TTL do lab = 15min + margem).
+# =============================================================================
+
+name: '🧹 Cleanup - Orphan Instances'
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # A cada 30 minutos
+  workflow_dispatch:         # Também pode ser disparado manualmente
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  MAX_AGE_MINUTES: 20
+
+jobs:
+  cleanup:
+    name: '🧹 Verificar instâncias órfãs'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Autenticação AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Buscar e terminar instâncias órfãs
+        run: |
+          echo "🧹 Verificando instâncias órfãs do lab SRE Demo..."
+
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Environment,Values=sre-demo" \
+              "Name=instance-state-name,Values=running,pending,stopped" \
+            --query 'Reservations[].Instances[].[InstanceId,LaunchTime]' \
+            --output text)
+
+          if [ -z "$INSTANCES" ]; then
+            echo "✓ Nenhuma instância ativa. Tudo limpo!"
+            exit 0
+          fi
+
+          NOW_EPOCH=$(date +%s)
+          TERMINATED=0
+
+          while IFS=$'\t' read -r INSTANCE_ID LAUNCH_TIME; do
+            LAUNCH_EPOCH=$(date -d "$LAUNCH_TIME" +%s)
+            AGE_MINUTES=$(( (NOW_EPOCH - LAUNCH_EPOCH) / 60 ))
+
+            if [ $AGE_MINUTES -gt ${{ env.MAX_AGE_MINUTES }} ]; then
+              echo "⚠️ Instância $INSTANCE_ID ativa há ${AGE_MINUTES}min (limite: ${{ env.MAX_AGE_MINUTES }}min)"
+              echo "   Terminando..."
+              aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
+              TERMINATED=$((TERMINATED + 1))
+            else
+              echo "ℹ️ Instância $INSTANCE_ID ativa há ${AGE_MINUTES}min (dentro do TTL)"
+            fi
+          done <<< "$INSTANCES"
+
+          if [ $TERMINATED -gt 0 ]; then
+            echo ""
+            echo "🗑️ $TERMINATED instância(s) órfã(s) terminada(s)."
+
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🧹 Cleanup Executado
+
+          **$TERMINATED instância(s) órfã(s) terminada(s).**
+
+          Instâncias com tag \`Environment=sre-demo\` que ultrapassaram ${MAX_AGE_MINUTES} minutos
+          foram terminadas automaticamente para evitar custos desnecessários.
+          EOF
+          else
+            echo "✓ Todas as instâncias estão dentro do TTL."
+          fi
