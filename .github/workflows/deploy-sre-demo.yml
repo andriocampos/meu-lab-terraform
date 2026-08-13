@@ -29,6 +29,15 @@ permissions:
   contents: read
   actions: write
 
+# -----------------------------------------------------------------------
+# BLOQUEIO DE CONCORRÊNCIA: Apenas uma execução por vez.
+# Se tentar rodar com outra ativa, fica em fila (cancel-in-progress: false)
+# ou cancela a nova (cancel-in-progress: true).
+# -----------------------------------------------------------------------
+concurrency:
+  group: sre-demo-lab
+  cancel-in-progress: false
+
 env:
   TF_WORKING_DIR: infra-demo
   AWS_REGION: us-east-1
