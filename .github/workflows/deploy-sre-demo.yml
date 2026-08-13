@@ -497,7 +497,7 @@ jobs:
     name: '🗑️ Destroy Concluído'
     runs-on: ubuntu-latest
     needs: infra
-    if: github.event.inputs.action == 'destroy'
+    if: always() && needs.infra.result == 'success' && github.event.inputs.action == 'destroy'
 
     steps:
       - name: Confirmar destruição
