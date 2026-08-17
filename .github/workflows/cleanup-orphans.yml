@@ -42,15 +42,10 @@ jobs:
         id: check
         run: |
           echo "🧹 Verificando infraestrutura órfã do lab SRE Demo..."
+          ORPHAN="false"
+          CLEANUP_TYPE=""
 
-          # Verificar se o bucket de state existe (indica lab ativo)
-          if ! aws s3api head-bucket --bucket "${{ env.STATE_BUCKET }}" 2>/dev/null; then
-            echo "✓ Nenhum lab ativo (bucket de state não existe). Tudo limpo!"
-            echo "orphan=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Bucket existe — verificar se há EC2 ativa e há quanto tempo
+          # CHECK 1: Verificar EC2 com tag sre-demo (fonte de custo principal)
           INSTANCE_INFO=$(aws ec2 describe-instances \
             --filters \
               "Name=tag:Environment,Values=sre-demo" \
@@ -58,39 +53,69 @@ jobs:
             --query 'Reservations[].Instances[].[InstanceId,LaunchTime]' \
             --output text)
 
-          if [ -z "$INSTANCE_INFO" ]; then
-            # Bucket existe mas sem EC2 = lixo de state. Limpar.
-            echo "⚠️ Bucket de state existe mas sem EC2 ativa. Limpando state órfão..."
-            echo "orphan=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          if [ -n "$INSTANCE_INFO" ]; then
+            INSTANCE_ID=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $1}')
+            LAUNCH_TIME=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $2}')
+            LAUNCH_EPOCH=$(date -d "$LAUNCH_TIME" +%s)
+            NOW_EPOCH=$(date +%s)
+            AGE_MINUTES=$(( (NOW_EPOCH - LAUNCH_EPOCH) / 60 ))
 
-          # Calcular idade da instância
-          LAUNCH_TIME=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $2}')
-          INSTANCE_ID=$(echo "$INSTANCE_INFO" | head -1 | awk '{print $1}')
-          LAUNCH_EPOCH=$(date -d "$LAUNCH_TIME" +%s)
-          NOW_EPOCH=$(date +%s)
-          AGE_MINUTES=$(( (NOW_EPOCH - LAUNCH_EPOCH) / 60 ))
+            echo "ℹ️ EC2 $INSTANCE_ID ativa há ${AGE_MINUTES} minutos (limite: ${{ env.MAX_AGE_MINUTES }}min)"
 
-          echo "ℹ️ Instância $INSTANCE_ID ativa há ${AGE_MINUTES} minutos (limite: ${{ env.MAX_AGE_MINUTES }}min)"
-
-          if [ $AGE_MINUTES -gt ${{ env.MAX_AGE_MINUTES }} ]; then
-            echo "⚠️ Instância ultrapassou o TTL! Iniciando destroy completo..."
-            echo "orphan=true" >> $GITHUB_OUTPUT
+            if [ $AGE_MINUTES -gt ${{ env.MAX_AGE_MINUTES }} ]; then
+              echo "⚠️ EC2 ultrapassou o TTL!"
+              ORPHAN="true"
+              CLEANUP_TYPE="ec2"
+            else
+              echo "✓ EC2 dentro do TTL."
+            fi
           else
-            echo "✓ Instância dentro do TTL. Auto-destroy do workflow principal deve cuidar."
-            echo "orphan=false" >> $GITHUB_OUTPUT
+            echo "✓ Nenhuma EC2 com tag sre-demo ativa."
           fi
+
+          # CHECK 2: Verificar VPC órfã (pode existir sem EC2)
+          VPC_INFO=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Environment,Values=sre-demo" \
+            --query 'Vpcs[].[VpcId]' \
+            --output text)
+
+          if [ -n "$VPC_INFO" ] && [ "$ORPHAN" == "false" ]; then
+            # VPC existe sem EC2 ativa que ultrapassou TTL = órfã
+            echo "⚠️ VPC órfã detectada: $VPC_INFO (sem EC2 associada ou EC2 dentro do TTL)"
+            # Se não tem EC2 ativa, é lixo
+            if [ -z "$INSTANCE_INFO" ]; then
+              ORPHAN="true"
+              CLEANUP_TYPE="vpc-only"
+            fi
+          fi
+
+          # CHECK 3: Verificar bucket de state (pode indicar state sujo)
+          if aws s3api head-bucket --bucket "${{ env.STATE_BUCKET }}" 2>/dev/null; then
+            echo "ℹ️ Bucket de state existe."
+            if [ "$ORPHAN" == "true" ]; then
+              CLEANUP_TYPE="full"
+            fi
+          else
+            echo "ℹ️ Bucket de state não existe."
+            if [ "$ORPHAN" == "true" ]; then
+              CLEANUP_TYPE="force-terminate"
+            fi
+          fi
+
+          echo "orphan=$ORPHAN" >> $GITHUB_OUTPUT
+          echo "cleanup_type=$CLEANUP_TYPE" >> $GITHUB_OUTPUT
+          echo ""
+          echo "Resultado: orphan=$ORPHAN | cleanup_type=$CLEANUP_TYPE"
 
       - name: Setup Terraform
-        if: steps.check.outputs.orphan == 'true'
+        if: steps.check.outputs.orphan == 'true' && steps.check.outputs.cleanup_type == 'full'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.5.7"
           terraform_wrapper: false
 
       - name: Terraform Init
-        if: steps.check.outputs.orphan == 'true'
+        if: steps.check.outputs.orphan == 'true' && steps.check.outputs.cleanup_type == 'full'
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           terraform init \
@@ -99,12 +124,12 @@ jobs:
             -backend-config="region=${{ env.AWS_REGION }}"
 
       - name: Terraform Destroy
-        if: steps.check.outputs.orphan == 'true'
+        if: steps.check.outputs.orphan == 'true' && steps.check.outputs.cleanup_type == 'full'
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform destroy -auto-approve
 
       - name: Destruir bucket de state S3
-        if: steps.check.outputs.orphan == 'true'
+        if: steps.check.outputs.orphan == 'true' && contains(steps.check.outputs.cleanup_type, 'full')
         run: |
           echo "🗑️ Removendo bucket de state..."
           aws s3api list-object-versions \
@@ -123,6 +148,92 @@ jobs:
             --delete file:///dev/stdin 2>/dev/null || true
           aws s3 rb "s3://${{ env.STATE_BUCKET }}" 2>/dev/null || true
           echo "✓ Bucket removido"
+
+      # -----------------------------------------------------------------------
+      # FORCE TERMINATE: Quando não há state (recursos fora do Terraform)
+      # Deleta EC2, SGs, Subnets, IGWs, Route Tables, Key Pairs e VPC por tag
+      # -----------------------------------------------------------------------
+      - name: Force Terminate (sem state)
+        if: steps.check.outputs.orphan == 'true' && (steps.check.outputs.cleanup_type == 'force-terminate' || steps.check.outputs.cleanup_type == 'vpc-only')
+        run: |
+          echo "🔥 FORCE TERMINATE — Removendo recursos órfãos por tag..."
+
+          # 1. Terminar EC2
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=tag:Environment,Values=sre-demo" "Name=instance-state-name,Values=running,pending,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          if [ -n "$INSTANCES" ]; then
+            echo "  Terminando EC2: $INSTANCES"
+            aws ec2 terminate-instances --instance-ids $INSTANCES
+            echo "  Aguardando terminação..."
+            aws ec2 wait instance-terminated --instance-ids $INSTANCES 2>/dev/null || sleep 30
+          fi
+
+          # 2. Deletar Key Pairs
+          KEY_PAIRS=$(aws ec2 describe-key-pairs \
+            --filters "Name=tag:Environment,Values=sre-demo" \
+            --query 'KeyPairs[].KeyName' --output text)
+          for KP in $KEY_PAIRS; do
+            echo "  Deletando key pair: $KP"
+            aws ec2 delete-key-pair --key-name "$KP"
+          done
+
+          # 3. Limpar VPCs com tag sre-demo
+          VPCS=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Environment,Values=sre-demo" \
+            --query 'Vpcs[].VpcId' --output text)
+
+          for VPC_ID in $VPCS; do
+            echo "  Limpando VPC: $VPC_ID"
+
+            # Route table associations (non-main)
+            RT_ASSOCS=$(aws ec2 describe-route-tables \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=association.main,Values=false" \
+              --query 'RouteTables[].Associations[].RouteTableAssociationId' --output text)
+            for ASSOC in $RT_ASSOCS; do
+              aws ec2 disassociate-route-table --association-id "$ASSOC" 2>/dev/null || true
+            done
+
+            # Route tables (non-main)
+            RTS=$(aws ec2 describe-route-tables \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=association.main,Values=false" \
+              --query 'RouteTables[].RouteTableId' --output text)
+            for RT in $RTS; do
+              aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
+            done
+
+            # Internet Gateways
+            IGWS=$(aws ec2 describe-internet-gateways \
+              --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+              --query 'InternetGateways[].InternetGatewayId' --output text)
+            for IGW in $IGWS; do
+              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC_ID"
+              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW"
+            done
+
+            # Subnets
+            SUBNETS=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'Subnets[].SubnetId' --output text)
+            for SN in $SUBNETS; do
+              aws ec2 delete-subnet --subnet-id "$SN" 2>/dev/null || true
+            done
+
+            # Security Groups (non-default)
+            SGS=$(aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text)
+            for SG in $SGS; do
+              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
+            done
+
+            # VPC
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null || true
+            echo "  ✓ VPC $VPC_ID removida"
+          done
+
+          echo ""
+          echo "✓ Force terminate concluído!"
 
       - name: Resumo
         if: steps.check.outputs.orphan == 'true'
